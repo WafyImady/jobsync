@@ -56,12 +56,12 @@ def extract_job_data(email_text: str):
     truncated_text = email_text[:3000]
     
     prompt = """
-    Analyze the following email. If it is a job application update, extract the company name and determine the status.
+    Analyze the following email. If it is a job application update, extract the company name, the role applied for, and determine the status.
     Status MUST be one of: 'Applied', 'Interviewing', 'Rejected', 'Offer'.
     If the email is promotional or unrelated to an active application, set status to 'ignore'.
     
     Return EXACTLY this JSON structure:
-    {"company_name": "String", "status": "String"}
+    {"company_name": "String", "role_title": "String", "status": "String"}
     
     Email content:
     """ + truncated_text
@@ -107,14 +107,14 @@ def extract_job_data(email_text: str):
                 # If it's a 429 or other error, let the main loop handle it
                 raise e
 
-def upsert_application(company_name: str, status: str, email_id: str, email_date):
+def upsert_application(company_name: str, role_title: str, status: str, email_id: str, email_date):
     """Upserts the extracted data and the email date into Neon Postgres."""
     
     conn_string = os.getenv("DATABASE_URL")
     upsert_query = """
-    INSERT INTO applications (company_name, status, source_email_id, date_received)
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT (source_email_id) 
+    INSERT INTO applications (company_name, role_title, status, source_email_id, date_received)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (company_name, role_title) 
     DO UPDATE SET 
         status = EXCLUDED.status,
         last_updated = CURRENT_TIMESTAMP;
@@ -123,8 +123,7 @@ def upsert_application(company_name: str, status: str, email_id: str, email_date
     try:
         with psycopg.connect(conn_string) as conn:
             with conn.cursor() as cur:
-                # Add email_date to the variables passed to SQL
-                cur.execute(upsert_query, (company_name, status, email_id, email_date))
+                cur.execute(upsert_query, (company_name, role_title, status, email_id, email_date))
             conn.commit()
             
             if status == 'ignore':
@@ -188,6 +187,7 @@ def process_recent_emails(service):
                     
                     upsert_application(
                         extracted_data.get('company_name', 'Unknown'), 
+                        extracted_data.get('role_title', 'Unknown Role'), 
                         extracted_data.get('status', 'ignore'), 
                         msg_id,
                         email_date
