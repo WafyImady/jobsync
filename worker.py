@@ -173,7 +173,8 @@ def process_recent_emails(service):
             email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
             
             # 🚨 THE NEW DATE EXTRACTION LOGIC
-            headers = msg['payload'].get('headers', [])
+            payload = message.get('payload', {})
+            headers = payload.get('headers', [])
             date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
             email_date = parsedate_to_datetime(date_header) if date_header else None
             
