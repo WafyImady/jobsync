@@ -177,13 +177,15 @@ def process_recent_emails(service):
             headers = payload.get('headers', [])
             date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
             email_date = parsedate_to_datetime(date_header) if date_header else None
-            
+
+            max_retries = 3
+            attempts = 0
             success = False
-            while not success:
+            
+            while not success and attempts < max_retries:
                 try:
                     extracted_data = extract_job_data(email_text)
                     
-                    # Pass the new email_date into the upsert function
                     upsert_application(
                         extracted_data.get('company_name', 'Unknown'), 
                         extracted_data.get('status', 'ignore'), 
@@ -195,12 +197,16 @@ def process_recent_emails(service):
                     time.sleep(5)
                     
                 except Exception as e:
+                    attempts += 1
                     if "429" in str(e):
-                        print("⏳ Rate limit reached. Waiting 60 seconds before retrying this email...")
-                        time.sleep(60) # Wait a full minute, then the while loop tries THIS email again
+                        print(f"⏳ Rate limit reached (Attempt {attempts}/{max_retries}). Waiting 60 seconds...")
+                        time.sleep(60)
                     else:
                         print(f"⚠️ Failed to process email {msg_id}: {e}")
-                        break # If it is a different error, break the loop and move on
+                        break # Break immediately for non-rate-limit errors
+            
+            if not success:
+                print(f"❌ Skipped email {msg_id} after {max_retries} failed attempts.")
 
 if __name__ == "__main__":
     print("Starting automated Reverse ATS pipeline...")
