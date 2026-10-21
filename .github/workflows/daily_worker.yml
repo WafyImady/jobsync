@@ -1,0 +1,33 @@
+name: Daily Reverse ATS Worker
+
+on:
+  schedule:
+    # Runs every day at 01:00 UTC (9:00 AM Malaysia Time)
+    - cron: '0 1 * * *' 
+  workflow_dispatch: # Adds a button to run it manually from GitHub
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Matches your environment
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Recreate Gmail Auth Files
+        run: |
+          echo '${{ secrets.GMAIL_CREDENTIALS }}' > credentials.json
+          echo '${{ secrets.GMAIL_TOKEN }}' > token.json
+
+      - name: Run Python Worker
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python worker.py
