@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import time
 import psycopg
 from dotenv import load_dotenv
 from google import genai
@@ -12,10 +13,10 @@ from googleapiclient.discovery import build
 # Load environment variables
 load_dotenv('.env.local')
 
-# 1. Initialize Gemini AI with the new official package
+# 1. Initialize Gemini AI
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# 2. Gmail API Scopes (Read-only)
+# 2. Gmail API Scopes
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 def authenticate_gmail():
@@ -36,8 +37,23 @@ def authenticate_gmail():
             
     return build('gmail', 'v1', credentials=creds)
 
+def get_processed_email_ids():
+    """Fetches a set of all email IDs already saved in the database to prevent duplicate processing."""
+    conn_string = os.getenv("DATABASE_URL")
+    try:
+        with psycopg.connect(conn_string) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT source_email_id FROM applications WHERE source_email_id IS NOT NULL")
+                return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        print(f"❌ Database error while fetching existing emails: {e}")
+        return set()
+
 def extract_job_data(email_text: str):
-    """Passes email text to Gemini to extract company and status."""
+    """Passes email text to Gemini with 3.6-flash fallback and exponential backoff for 503s."""
+    
+    truncated_text = email_text[:3000]
+    
     prompt = """
     Analyze the following email. If it is a job application update, extract the company name and determine the status.
     Status MUST be one of: 'Applied', 'Interviewing', 'Rejected', 'Offer'.
@@ -47,21 +63,52 @@ def extract_job_data(email_text: str):
     {"company_name": "String", "status": "String"}
     
     Email content:
-    """ + email_text
+    """ + truncated_text
     
-    response = gemini_client.models.generate_content(
-        model='gemini-3.8-flash',
-        contents=prompt,
-        config={"response_mime_type": "application/json"}
-    )
-    return json.loads(response.text)
+    max_retries = 3
+    base_wait_time = 2  # Start with a 2-second wait
+    
+    for attempt in range(max_retries):
+        try:
+            # Try primary model first
+            response = gemini_client.models.generate_content(
+                model='gemini-3.8-flash',
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            return json.loads(response.text)
+        
+        except Exception as e:
+            error_message = str(e)
+            if "503" in error_message or "500" in error_message:
+                print(f"⚠️ Primary model 503. Falling back to 3.6-flash...")
+                try:
+                    # Fallback to secondary model
+                    backup_response = gemini_client.models.generate_content(
+                        model='gemini-3.6-flash',
+                        contents=prompt,
+                        config={"response_mime_type": "application/json"}
+                    )
+                    return json.loads(backup_response.text)
+                except Exception as backup_error:
+                    if "503" in str(backup_error) or "500" in str(backup_error):
+                         # If BOTH fail with 503, apply backoff
+                         if attempt < max_retries - 1:
+                             wait_time = base_wait_time * (2 ** attempt) # Wait 2s, then 4s...
+                             print(f"⏳ Both models 503. Retrying in {wait_time} seconds (Attempt {attempt + 1}/{max_retries})...")
+                             time.sleep(wait_time)
+                         else:
+                             print("❌ Max retries reached for 503 errors. Skipping email.")
+                             raise backup_error # Give up after 3 tries
+                    else:
+                        raise backup_error
+            else:
+                # If it's a 429 or other error, let the main loop handle it
+                raise e
 
 def upsert_application(company_name: str, status: str, email_id: str):
     """Upserts the extracted data into Neon Postgres."""
-    if status == 'ignore':
-        print(f"Ignored unrelated email: {email_id}")
-        return
-
+    
     conn_string = os.getenv("DATABASE_URL")
     upsert_query = """
     INSERT INTO applications (company_name, status, source_email_id)
@@ -77,14 +124,18 @@ def upsert_application(company_name: str, status: str, email_id: str):
             with conn.cursor() as cur:
                 cur.execute(upsert_query, (company_name, status, email_id))
             conn.commit()
-            print(f"✅ Success: Upserted {company_name} - {status}")
+            
+            if status == 'ignore':
+                print(f"✅ Logged junk email in DB. It will be skipped forever: {email_id}")
+            else:
+                print(f"✅ Success: Upserted {company_name} - {status}")
     except Exception as e:
         print(f"❌ Database error: {e}")
 
 def process_recent_emails(service):
-    """Fetches recent emails and runs them through the pipeline."""
+    """Fetches recent emails, skips processed ones, and runs them through the pipeline."""
     print("Fetching recent emails...")
-    query = "newer_than:7d (application OR interview OR status OR update)"
+    query = "newer_than:2d (application OR interview OR offer OR rejected)"
     results = service.users().messages().list(userId='me', q=query, maxResults=50).execute()
     messages = results.get('messages', [])
 
@@ -92,8 +143,17 @@ def process_recent_emails(service):
         print("No new emails found matching the criteria.")
         return
 
+    # 1. Get the list of emails we already processed from the database
+    processed_ids = get_processed_email_ids()
+
     for msg in messages:
         msg_id = msg['id']
+        
+        # 2. Skip if the email is already in the database
+        if msg_id in processed_ids:
+            print(f"⏭️ Skipping already processed email: {msg_id}")
+            continue
+            
         message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         payload = message.get('payload', {})
@@ -110,11 +170,22 @@ def process_recent_emails(service):
         if body_data:
             email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
             
-            try:
-                extracted_data = extract_job_data(email_text)
-                upsert_application(extracted_data.get('company_name', 'Unknown'), extracted_data.get('status', 'ignore'), msg_id)
-            except Exception as e:
-                print(f"⚠️ Failed to process email {msg_id}: {e}")
+            success = False
+            while not success:
+                try:
+                    extracted_data = extract_job_data(email_text)
+                    upsert_application(extracted_data.get('company_name', 'Unknown'), extracted_data.get('status', 'ignore'), msg_id)
+                    
+                    success = True # Marks this email as done so the loop can move on
+                    time.sleep(5)  # Steady 5-second pace between successful emails
+                    
+                except Exception as e:
+                    if "429" in str(e):
+                        print("⏳ Rate limit reached. Waiting 60 seconds before retrying this email...")
+                        time.sleep(60) # Wait a full minute, then the while loop tries THIS email again
+                    else:
+                        print(f"⚠️ Failed to process email {msg_id}: {e}")
+                        break # If it is a different error, break the loop and move on
 
 if __name__ == "__main__":
     print("Starting automated Reverse ATS pipeline...")
