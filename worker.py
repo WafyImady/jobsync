@@ -9,6 +9,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from email.utils import parsedate_to_datetime
 
 # Load environment variables
 load_dotenv('.env.local')
@@ -106,13 +107,13 @@ def extract_job_data(email_text: str):
                 # If it's a 429 or other error, let the main loop handle it
                 raise e
 
-def upsert_application(company_name: str, status: str, email_id: str):
-    """Upserts the extracted data into Neon Postgres."""
+def upsert_application(company_name: str, status: str, email_id: str, email_date):
+    """Upserts the extracted data and the email date into Neon Postgres."""
     
     conn_string = os.getenv("DATABASE_URL")
     upsert_query = """
-    INSERT INTO applications (company_name, status, source_email_id)
-    VALUES (%s, %s, %s)
+    INSERT INTO applications (company_name, status, source_email_id, date_received)
+    VALUES (%s, %s, %s, %s)
     ON CONFLICT (source_email_id) 
     DO UPDATE SET 
         status = EXCLUDED.status,
@@ -122,13 +123,14 @@ def upsert_application(company_name: str, status: str, email_id: str):
     try:
         with psycopg.connect(conn_string) as conn:
             with conn.cursor() as cur:
-                cur.execute(upsert_query, (company_name, status, email_id))
+                # Add email_date to the variables passed to SQL
+                cur.execute(upsert_query, (company_name, status, email_id, email_date))
             conn.commit()
             
             if status == 'ignore':
-                print(f"✅ Logged junk email in DB. It will be skipped forever: {email_id}")
+                print(f"✅ Logged junk email: {email_id}")
             else:
-                print(f"✅ Success: Upserted {company_name} - {status}")
+                print(f"✅ Success: Upserted {company_name} - {status} ({email_date.date()})")
     except Exception as e:
         print(f"❌ Database error: {e}")
 
@@ -170,14 +172,26 @@ def process_recent_emails(service):
         if body_data:
             email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
             
+            # 🚨 THE NEW DATE EXTRACTION LOGIC
+            headers = msg['payload'].get('headers', [])
+            date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
+            email_date = parsedate_to_datetime(date_header) if date_header else None
+            
             success = False
             while not success:
                 try:
                     extracted_data = extract_job_data(email_text)
-                    upsert_application(extracted_data.get('company_name', 'Unknown'), extracted_data.get('status', 'ignore'), msg_id)
                     
-                    success = True # Marks this email as done so the loop can move on
-                    time.sleep(5)  # Steady 5-second pace between successful emails
+                    # Pass the new email_date into the upsert function
+                    upsert_application(
+                        extracted_data.get('company_name', 'Unknown'), 
+                        extracted_data.get('status', 'ignore'), 
+                        msg_id,
+                        email_date
+                    )
+                    
+                    success = True 
+                    time.sleep(5)
                     
                 except Exception as e:
                     if "429" in str(e):
