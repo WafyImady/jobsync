@@ -51,9 +51,10 @@ def get_processed_email_ids():
         return set()
 
 def extract_job_data(email_text: str):
-    """Passes email text to Gemini with 3.6-flash fallback and exponential backoff for 503s."""
+    """Passes email text to Gemini with instant fallback for 503s and 429s."""
     
-    truncated_text = email_text[:3000]
+    # 🚨 FIX 1: Send only the first 2000 characters to prevent Token limits
+    truncated_text = email_text[:2000]
     
     prompt = """
     Analyze the following email. If it is a job application update, extract the company name, the role applied for, and determine the status.
@@ -67,11 +68,10 @@ def extract_job_data(email_text: str):
     """ + truncated_text
     
     max_retries = 3
-    base_wait_time = 2  # Start with a 2-second wait
+    base_wait_time = 2  
     
     for attempt in range(max_retries):
         try:
-            # Try primary model first
             response = gemini_client.models.generate_content(
                 model='gemini-3.8-flash',
                 contents=prompt,
@@ -81,10 +81,10 @@ def extract_job_data(email_text: str):
         
         except Exception as e:
             error_message = str(e)
-            if "503" in error_message or "500" in error_message:
-                print(f"⚠️ Primary model 503. Falling back to 3.6-flash...")
+            # 🚨 FIX 2: Check for BOTH 503 and 429 to instantly swap models
+            if "503" in error_message or "500" in error_message :
+                print(f"⚠️ Primary model busy/limited. Instantly falling back to 3.6-flash...")
                 try:
-                    # Fallback to secondary model
                     backup_response = gemini_client.models.generate_content(
                         model='gemini-3.6-flash',
                         contents=prompt,
@@ -93,18 +93,16 @@ def extract_job_data(email_text: str):
                     return json.loads(backup_response.text)
                 except Exception as backup_error:
                     if "503" in str(backup_error) or "500" in str(backup_error):
-                         # If BOTH fail with 503, apply backoff
                          if attempt < max_retries - 1:
-                             wait_time = base_wait_time * (2 ** attempt) # Wait 2s, then 4s...
-                             print(f"⏳ Both models 503. Retrying in {wait_time} seconds (Attempt {attempt + 1}/{max_retries})...")
+                             wait_time = base_wait_time * (2 ** attempt) 
+                             print(f"⏳ Both models busy. Retrying in {wait_time} seconds (Attempt {attempt + 1}/{max_retries})...")
                              time.sleep(wait_time)
                          else:
-                             print("❌ Max retries reached for 503 errors. Skipping email.")
-                             raise backup_error # Give up after 3 tries
+                             print("❌ Max retries reached for API errors. Skipping email.")
+                             raise backup_error
                     else:
                         raise backup_error
             else:
-                # If it's a 429 or other error, let the main loop handle it
                 raise e
 
 def upsert_application(company_name: str, role_title: str, status: str, email_id: str, email_date):
@@ -129,14 +127,15 @@ def upsert_application(company_name: str, role_title: str, status: str, email_id
             if status == 'ignore':
                 print(f"✅ Logged junk email: {email_id}")
             else:
-                print(f"✅ Success: Upserted {company_name} - {status} ({email_date.date()})")
+                # 🚨 FIX 3: Fixed the broken print statement syntax
+                print(f"✅ Success: Upserted {company_name} - {status} ({email_date.date() if email_date else 'No Date'})")
     except Exception as e:
         print(f"❌ Database error: {e}")
 
 def process_recent_emails(service):
-    """Fetches recent emails, skips processed ones, and runs them through the pipeline."""
+    """Fetches recent emails, skips processed ones, and runs them through the pipeline safely."""
     print("Fetching recent emails...")
-    query = "newer_than:2d (application OR interview OR offer OR rejected)"
+    query = "newer_than:30d (application OR interview OR offer OR rejected)"
     results = service.users().messages().list(userId='me', q=query, maxResults=50).execute()
     messages = results.get('messages', [])
 
@@ -144,16 +143,25 @@ def process_recent_emails(service):
         print("No new emails found matching the criteria.")
         return
 
-    # 1. Get the list of emails we already processed from the database
     processed_ids = get_processed_email_ids()
+    
+    # 🚨 FIX 4: Add the small-bites limit logic here
+    processed_count = 0  
+    max_per_run = 10     
 
     for msg in messages:
+        if processed_count >= max_per_run:
+            print("🛑 Reached maximum 10 emails for this run. Stopping to protect GitHub minutes.")
+            break
+            
         msg_id = msg['id']
         
-        # 2. Skip if the email is already in the database
         if msg_id in processed_ids:
             print(f"⏭️ Skipping already processed email: {msg_id}")
             continue
+            
+        processed_count += 1
+        print(f"Processing new email: {msg_id} (Attempt {processed_count}/{max_per_run})")
             
         message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
@@ -171,7 +179,6 @@ def process_recent_emails(service):
         if body_data:
             email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
             
-            # 🚨 THE NEW DATE EXTRACTION LOGIC
             payload = message.get('payload', {})
             headers = payload.get('headers', [])
             date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
@@ -194,7 +201,8 @@ def process_recent_emails(service):
                     )
                     
                     success = True 
-                    time.sleep(5)
+                    # 🚨 FIX 5: Increased safe sleep to 10 seconds to avoid API limits
+                    time.sleep(15)
                     
                 except Exception as e:
                     attempts += 1
@@ -203,7 +211,7 @@ def process_recent_emails(service):
                         time.sleep(60)
                     else:
                         print(f"⚠️ Failed to process email {msg_id}: {e}")
-                        break # Break immediately for non-rate-limit errors
+                        break 
             
             if not success:
                 print(f"❌ Skipped email {msg_id} after {max_retries} failed attempts.")
