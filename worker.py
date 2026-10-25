@@ -193,8 +193,8 @@ def process_recent_emails(service):
                     extracted_data = extract_job_data(email_text)
                     
                     upsert_application(
-                        extracted_data.get('company_name', 'Unknown'), 
-                        extracted_data.get('role_title', 'Unknown Role'), 
+                        extracted_data.get('company_name', 'Unknown').strip().title(), 
+                        extracted_data.get('role_title', 'Unknown Role').strip().title(),
                         extracted_data.get('status', 'ignore'), 
                         msg_id,
                         email_date
