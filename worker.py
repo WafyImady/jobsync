@@ -147,11 +147,11 @@ def process_recent_emails(service):
     
     # 🚨 FIX 4: Add the small-bites limit logic here
     processed_count = 0  
-    max_per_run = 10     
+    max_per_run = 30     
 
     for msg in messages:
         if processed_count >= max_per_run:
-            print("🛑 Reached maximum 10 emails for this run. Stopping to protect GitHub minutes.")
+            print("🛑 Reached maximum 30 emails for this run. Stopping to protect GitHub minutes.")
             break
             
         msg_id = msg['id']
