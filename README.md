@@ -33,7 +33,7 @@ Standard ATS platforms are enterprise tools used by companies to ingest resumes,
 
 ## ⚙️ How It Works
 
-1. **Trigger:** GitHub Actions runs the `pipeline.py` script on a set cron schedule.
+1. **Trigger:** GitHub Actions runs the `worker.py` script on a set cron schedule.
 2. **Fetch:** The script authenticates with the Gmail API and fetches the latest batch of unread emails.
 3. **Analyze:** Email bodies are decoded and sent to the Gemini API with a strict JSON schema prompt to extract the `company_name`, `role_title`, and `status`.
 4. **Store:** The extracted data is upserted into a Neon PostgreSQL database.
