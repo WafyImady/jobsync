@@ -60,5 +60,5 @@ npm run dev
 **Run the Pipeline (Manual):**
 
 ```bash
-python pipeline.py
+python worker.py
 ```
