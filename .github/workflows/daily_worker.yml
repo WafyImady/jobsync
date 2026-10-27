@@ -23,8 +23,12 @@ jobs:
 
       - name: Recreate Gmail Auth Files
         run: |
-          echo '${{ secrets.GMAIL_CREDENTIALS }}' > credentials.json
-          echo '${{ secrets.GMAIL_TOKEN }}' > token.json
+          cat << 'EOF' > credentials.json
+          ${{ secrets.GMAIL_CREDENTIALS }}
+          EOF
+          cat << 'EOF' > token.json
+          ${{ secrets.GMAIL_TOKEN }}
+          EOF
 
       - name: Run Python Worker
         env:
