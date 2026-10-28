@@ -181,11 +181,17 @@ def process_recent_emails(service):
 
         if body_data:
             email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
-            
+                
             payload = message.get('payload', {})
             headers = payload.get('headers', [])
+                
+            # Extract Date and Subject headers
             date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
+            subject_header = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
             email_date = parsedate_to_datetime(date_header) if date_header else None
+                
+            # Combine Subject and Body for the AI to read
+            combined_text = f"Subject: {subject_header}\n\nEmail Body:\n{email_text}"
 
             max_retries = 3
             attempts = 0
@@ -193,7 +199,7 @@ def process_recent_emails(service):
             
             while not success and attempts < max_retries:
                 try:
-                    extracted_data = extract_job_data(email_text)
+                    extracted_data = extract_job_data(combined_text)
                     
                     upsert_application(
                         extracted_data.get('company_name', 'Unknown').strip().title(), 
