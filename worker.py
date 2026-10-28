@@ -63,6 +63,7 @@ def extract_job_data(email_text: str):
     Analyze the following email. If it is a job application update, extract the company name, the role applied for, and determine the status.
     Status MUST be one of: 'Applied', 'Interviewing', 'Rejected', 'Offer'.
     If the email is promotional or unrelated to an active application, set status to 'ignore'.
+    CRITICAL: Ignore job board platforms like 'Indeed', 'LinkedIn', 'JobStreet', 'Hiredly', or 'Glassdoor' for the company name. Extract the ACTUAL hiring company.
     
     Return EXACTLY this JSON structure:
     {"company_name": "String", "role_title": "String", "status": "String"}
@@ -202,9 +203,9 @@ def process_recent_emails(service):
                     extracted_data = extract_job_data(combined_text)
                     
                     upsert_application(
-                        extracted_data.get('company_name', 'Unknown').strip().title(), 
-                        extracted_data.get('role_title', 'Unknown Role').strip().title(),
-                        extracted_data.get('status', 'ignore'), 
+                        (extracted_data.get('company_name') or 'Unknown').strip().title(), 
+                        (extracted_data.get('role_title') or 'Unknown Role').strip().title(),
+                        extracted_data.get('status') or 'ignore', 
                         msg_id,
                         email_date
                     )
@@ -224,6 +225,9 @@ def process_recent_emails(service):
             
             if not success:
                 print(f"❌ Skipped email {msg_id} after {max_retries} failed attempts.")
+
+        else:
+            print(f"⚠️ Skipped email {msg_id}: No plain text body found to parse.")
 
 if __name__ == "__main__":
     print("Starting automated Reverse ATS pipeline...")
