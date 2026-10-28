@@ -15,7 +15,10 @@ from email.utils import parsedate_to_datetime
 load_dotenv('.env.local')
 
 # 1. Initialize Gemini AI
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+gemini_client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    http_options={'timeout': 30000} # 30 seconds in milliseconds
+)
 
 # 2. Gmail API Scopes
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
