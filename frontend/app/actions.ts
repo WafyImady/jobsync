@@ -1,19 +1,41 @@
 'use server';
 
-import pool from '../lib/db';
 import { revalidatePath } from 'next/cache';
+import { isAuthenticated } from '../lib/auth';
+import pool from '../lib/db';
+
+const VALID_STATUSES = new Set([
+  'Applied',
+  'Interviewing',
+  'Offer',
+  'Rejected',
+  'Ignore',
+]);
 
 export async function updateApplicationStatus(id: number | string, newStatus: string) {
   try {
-    // Update the record in the Neon database
+    if (!(await isAuthenticated())) {
+      return { success: false, error: 'Unauthorized' };
+    }
+
+    const applicationId = Number(id);
+    const normalizedStatus = String(newStatus).trim();
+
+    if (!Number.isInteger(applicationId) || applicationId <= 0) {
+      return { success: false, error: 'Invalid application id' };
+    }
+
+    if (!VALID_STATUSES.has(normalizedStatus)) {
+      return { success: false, error: 'Invalid status' };
+    }
+
     await pool.query(
       'UPDATE applications SET status = $1, last_updated = CURRENT_TIMESTAMP WHERE id = $2',
-      [newStatus, id]
+      [normalizedStatus, applicationId]
     );
-    
-    // Tell Next.js to refresh the homepage data in the background
+
     revalidatePath('/');
-    
+
     return { success: true };
   } catch (error) {
     console.error('Failed to update application status:', error);

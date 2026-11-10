@@ -46,7 +46,11 @@ To run this project locally, you will need to set up the following environment v
 ```
 DATABASE_URL="your_neon_postgres_connection_string"
 GEMINI_API_KEY="your_google_gemini_api_key"
+ADMIN_USERNAME="admin"
+ADMIN_PASSWORD="a-strong-admin-password"
 ```
+
+The dashboard requires an authenticated admin session before it will read or update application data. `ADMIN_PASSWORD` (or `ADMIN_SECRET`) is used as the shared secret for the login. Keep it out of source control and never commit a real value.
 
 *Note: You must also generate a `credentials.json` file from the Google Cloud Console for Gmail API access.*
 

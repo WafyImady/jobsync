@@ -1,5 +1,6 @@
 import { Suspense } from 'react';
 import pool from '../lib/db';
+import { requireAdminAccess } from '../lib/auth';
 import KanbanBoard from '../components/KanbanBoard';
 
 async function BoardData() {
@@ -10,11 +11,16 @@ async function BoardData() {
   return <KanbanBoard initialApplications={applications} />;
 }
 
+async function ProtectedBoard() {
+  await requireAdminAccess();
+  return <BoardData />;
+}
+
 export default function Home() {
   return (
     <main className="min-h-screen bg-surface">
       <Suspense fallback={<div className="p-8 text-on-surface">Loading pipeline...</div>}>
-        <BoardData />
+        <ProtectedBoard />
       </Suspense>
     </main>
   );
