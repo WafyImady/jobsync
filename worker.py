@@ -1,7 +1,10 @@
 import os
 import json
 import base64
+import random
+import re
 import time
+from html.parser import HTMLParser
 import psycopg
 from dotenv import load_dotenv
 from google import genai
@@ -23,6 +26,73 @@ gemini_client = genai.Client(
 # 2. Gmail API Scopes
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
+TRANSIENT_MODEL_STATUSES = {'429', '500', '503', '504'}
+TRANSIENT_MODEL_ERRORS = (
+    'deadline_exceeded',
+    'resource_exhausted',
+    'temporarily unavailable',
+    'timed out',
+    'timeout',
+    'connection reset',
+)
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text = []
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+def _is_transient_model_error(error):
+    status_codes = {
+        str(getattr(error, attribute, ''))
+        for attribute in ('code', 'status_code')
+    }
+    response = getattr(error, 'response', None)
+    if response is not None:
+        status_codes.add(str(getattr(response, 'status_code', '')))
+
+    message = str(error).lower()
+    status_codes.update(re.findall(r'\b(?:429|500|503|504)\b', message))
+    return bool(status_codes & TRANSIENT_MODEL_STATUSES) or any(
+        marker in message for marker in TRANSIENT_MODEL_ERRORS
+    )
+
+
+def _decode_part(part):
+    data = part.get('body', {}).get('data')
+    if not data:
+        return ''
+    padded_data = data + '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded_data).decode('utf-8', errors='replace')
+
+
+def _email_body(payload):
+    plain_text = []
+    html_text = []
+    parts = [payload]
+
+    while parts:
+        part = parts.pop()
+        mime_type = part.get('mimeType', '').lower()
+        if mime_type in ('text/plain', 'text/html'):
+            decoded = _decode_part(part)
+            if decoded.strip():
+                (plain_text if mime_type == 'text/plain' else html_text).append(decoded)
+        parts.extend(reversed(part.get('parts', [])))
+
+    if plain_text:
+        return plain_text[0]
+    if html_text:
+        extractor = _HTMLTextExtractor()
+        extractor.feed(html_text[0])
+        return ' '.join(' '.join(extractor.text).split())
+    return ''
+
+
 def authenticate_gmail():
     """Handles OAuth 2.0 flow and generates/loads token.json."""
     creds = None
@@ -42,19 +112,44 @@ def authenticate_gmail():
     return build('gmail', 'v1', credentials=creds)
 
 def get_processed_email_ids():
-    """Fetches a set of all email IDs already saved in the database to prevent duplicate processing."""
+    """Fetches email IDs recorded after successful processing."""
     conn_string = os.getenv("DATABASE_URL")
-    try:
-        with psycopg.connect(conn_string) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT source_email_id FROM applications WHERE source_email_id IS NOT NULL")
-                return {row[0] for row in cur.fetchall()}
-    except Exception as e:
-        print(f"❌ Database error while fetching existing emails: {e}")
-        return set()
+    with psycopg.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS worker_processed_emails (
+                    source_email_id TEXT PRIMARY KEY,
+                    outcome TEXT NOT NULL DEFAULT 'processed',
+                    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                INSERT INTO worker_processed_emails (source_email_id)
+                SELECT source_email_id
+                FROM applications
+                WHERE source_email_id IS NOT NULL
+                ON CONFLICT (source_email_id) DO NOTHING
+            """)
+            cur.execute("SELECT source_email_id FROM worker_processed_emails")
+            return {row[0] for row in cur.fetchall()}
+
+
+def record_processed_email(email_id, outcome='processed'):
+    conn_string = os.getenv("DATABASE_URL")
+    with psycopg.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO worker_processed_emails (source_email_id, outcome)
+                VALUES (%s, %s)
+                ON CONFLICT (source_email_id)
+                DO UPDATE SET outcome = EXCLUDED.outcome
+                """,
+                (email_id, outcome)
+            )
 
 def extract_job_data(email_text: str):
-    """Passes email text to Gemini with instant fallback for 503s and 429s."""
+    """Extracts job data, falling back and retrying transient Gemini failures."""
     
     # 🚨 FIX 1: Send only the first 2000 characters to prevent Token limits
     truncated_text = email_text[:2000]
@@ -72,42 +167,55 @@ def extract_job_data(email_text: str):
     """ + truncated_text
     
     max_retries = 3
-    base_wait_time = 2  
-    
+    models = ('gemini-3.8-flash', 'gemini-3.6-flash')
+    last_error = None
+
     for attempt in range(max_retries):
-        try:
-            response = gemini_client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
+        for model_index, model in enumerate(models):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"}
+                )
+                extracted_data = json.loads(response.text)
+                if not isinstance(extracted_data, dict):
+                    raise ValueError("Gemini response must be a JSON object")
+                valid_statuses = {
+                    'applied': 'Applied',
+                    'interviewing': 'Interviewing',
+                    'rejected': 'Rejected',
+                    'offer': 'Offer',
+                    'ignore': 'ignore',
+                }
+                for field in ('company_name', 'role_title', 'status'):
+                    if not isinstance(extracted_data.get(field), str) or not extracted_data[field].strip():
+                        raise ValueError(f"Gemini response has an invalid {field}")
+                status = extracted_data['status'].strip().lower()
+                if status not in valid_statuses:
+                    raise ValueError(f"Gemini response has an invalid status: {status}")
+                extracted_data['company_name'] = extracted_data['company_name'].strip()
+                extracted_data['role_title'] = extracted_data['role_title'].strip()
+                extracted_data['status'] = valid_statuses[status]
+                return extracted_data
+            except Exception as error:
+                if not _is_transient_model_error(error):
+                    raise
+                last_error = error
+                if model_index == 0:
+                    print("⚠️ Primary model busy or timed out; trying fallback model...")
+                else:
+                    print(f"⚠️ Fallback model also failed transiently: {error}")
+
+        if attempt < max_retries - 1:
+            wait_time = min(30, 5 * (2 ** attempt)) + random.uniform(0, 2)
+            print(
+                f"⏳ Both models unavailable. Retrying in {wait_time:.1f} seconds "
+                f"(retry {attempt + 1}/{max_retries - 1})..."
             )
-            return json.loads(response.text)
-        
-        except Exception as e:
-            error_message = str(e)
-            # 🚨 FIX 2: Check for BOTH 503 and 429 to instantly swap models
-            if "503" in error_message or "500" in error_message :
-                print(f"⚠️ Primary model busy/limited. Instantly falling back to 3.6-flash...")
-                try:
-                    backup_response = gemini_client.models.generate_content(
-                        model='gemini-3.6-flash',
-                        contents=prompt,
-                        config={"response_mime_type": "application/json"}
-                    )
-                    return json.loads(backup_response.text)
-                except Exception as backup_error:
-                    if "503" in str(backup_error) or "500" in str(backup_error):
-                         if attempt < max_retries - 1:
-                             wait_time = base_wait_time * (2 ** attempt) 
-                             print(f"⏳ Both models busy. Retrying in {wait_time} seconds (Attempt {attempt + 1}/{max_retries})...")
-                             time.sleep(wait_time)
-                         else:
-                             print("❌ Max retries reached for API errors. Skipping email.")
-                             raise backup_error
-                    else:
-                        raise backup_error
-            else:
-                raise e
+            time.sleep(wait_time)
+
+    raise last_error
 
 def upsert_application(company_name: str, role_title: str, status: str, email_id: str, email_date):
     """Upserts the extracted data and the email date into Neon Postgres."""
@@ -122,19 +230,9 @@ def upsert_application(company_name: str, role_title: str, status: str, email_id
         last_updated = CURRENT_TIMESTAMP;
     """
     
-    try:
-        with psycopg.connect(conn_string) as conn:
-            with conn.cursor() as cur:
-                cur.execute(upsert_query, (company_name, role_title, status, email_id, email_date))
-            conn.commit()
-            
-            if status == 'ignore':
-                print(f"✅ Logged junk email: {email_id}")
-            else:
-                # 🚨 FIX 3: Fixed the broken print statement syntax
-                print(f"✅ Success: Upserted {company_name} - {status} ({email_date.date() if email_date else 'No Date'})")
-    except Exception as e:
-        print(f"❌ Database error: {e}")
+    with psycopg.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute(upsert_query, (company_name, role_title, status, email_id, email_date))
 
 def process_recent_emails(service):
     """Fetches recent emails, skips processed ones, and runs them through the pipeline safely."""
@@ -149,12 +247,13 @@ def process_recent_emails(service):
 
     processed_ids = get_processed_email_ids()
     
-    # 🚨 FIX 4: Add the small-bites limit logic here
-    processed_count = 0  
-    max_per_run = 30     
+    attempted_count = 0
+    recorded_count = 0
+    failed_count = 0
+    max_per_run = 30
 
     for msg in messages:
-        if processed_count >= max_per_run:
+        if attempted_count >= max_per_run:
             print("🛑 Reached maximum 30 emails for this run. Stopping to protect GitHub minutes.")
             break
             
@@ -164,70 +263,61 @@ def process_recent_emails(service):
             print(f"⏭️ Skipping already processed email: {msg_id}")
             continue
             
-        processed_count += 1
-        print(f"Processing new email: {msg_id} (Attempt {processed_count}/{max_per_run})")
-            
-        message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-        
-        payload = message.get('payload', {})
-        body_data = ""
-        
-        if 'parts' in payload:
-            for part in payload['parts']:
-                if part['mimeType'] == 'text/plain':
-                    body_data = part['body'].get('data', '')
-                    break
-        else:
-            body_data = payload.get('body', {}).get('data', '')
+        attempted_count += 1
+        print(f"Processing email {attempted_count}/{max_per_run}: {msg_id}")
 
-        if body_data:
-            email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
-                
+        try:
+            message = service.users().messages().get(
+                userId='me', id=msg_id, format='full'
+            ).execute()
             payload = message.get('payload', {})
+            email_text = _email_body(payload)
+
+            if not email_text:
+                print(f"⚠️ Skipping email {msg_id}: no readable plain-text or HTML body.")
+                record_processed_email(msg_id, 'skipped_no_body')
+                processed_ids.add(msg_id)
+                recorded_count += 1
+                continue
+
             headers = payload.get('headers', [])
-                
-            # Extract Date and Subject headers
-            date_header = next((h['value'] for h in headers if h['name'] == 'Date'), None)
-            subject_header = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+            date_header = next(
+                (header['value'] for header in headers if header['name'].lower() == 'date'),
+                None
+            )
+            subject_header = next(
+                (header['value'] for header in headers if header['name'].lower() == 'subject'),
+                'No Subject'
+            )
             email_date = parsedate_to_datetime(date_header) if date_header else None
-                
-            # Combine Subject and Body for the AI to read
             combined_text = f"Subject: {subject_header}\n\nEmail Body:\n{email_text}"
+            extracted_data = extract_job_data(combined_text)
 
-            max_retries = 3
-            attempts = 0
-            success = False
-            
-            while not success and attempts < max_retries:
-                try:
-                    extracted_data = extract_job_data(combined_text)
-                    
-                    upsert_application(
-                        (extracted_data.get('company_name') or 'Unknown').strip().title(), 
-                        (extracted_data.get('role_title') or 'Unknown Role').strip().title(),
-                        extracted_data.get('status') or 'ignore', 
-                        msg_id,
-                        email_date
-                    )
-                    
-                    success = True 
-                    # 🚨 FIX 5: Increased safe sleep to 10 seconds to avoid API limits
-                    time.sleep(15)
-                    
-                except Exception as e:
-                    attempts += 1
-                    if "429" in str(e):
-                        print(f"⏳ Rate limit reached (Attempt {attempts}/{max_retries}). Waiting 60 seconds...")
-                        time.sleep(60)
-                    else:
-                        print(f"⚠️ Failed to process email {msg_id}: {e}")
-                        break 
-            
-            if not success:
-                print(f"❌ Skipped email {msg_id} after {max_retries} failed attempts.")
+            company_name = extracted_data['company_name'].title()
+            role_title = extracted_data['role_title'].title()
+            status = extracted_data['status']
 
-        else:
-            print(f"⚠️ Skipped email {msg_id}: No plain text body found to parse.")
+            upsert_application(company_name, role_title, status, msg_id, email_date)
+            record_processed_email(msg_id)
+            processed_ids.add(msg_id)
+            recorded_count += 1
+
+            if status.lower() == 'ignore':
+                print(f"✅ Logged junk email: {msg_id}")
+            else:
+                received_date = email_date.date() if email_date else 'No Date'
+                print(f"✅ Success: Upserted {company_name} - {status} ({received_date})")
+            time.sleep(15)
+        except Exception as error:
+            failed_count += 1
+            print(f"⚠️ Failed to process email {msg_id}; it can be retried next run: {error}")
+
+    print(
+        f"Worker summary: {attempted_count} attempted, "
+        f"{recorded_count} recorded as processed or skipped, {failed_count} failed."
+    )
+    if failed_count:
+        raise RuntimeError(f"{failed_count} email(s) failed; see errors above.")
 
 if __name__ == "__main__":
     print("Starting automated Reverse ATS pipeline...")
