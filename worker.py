@@ -37,6 +37,10 @@ TRANSIENT_MODEL_ERRORS = (
 )
 
 
+class GeminiDailyQuotaExceeded(Exception):
+    pass
+
+
 class _HTMLTextExtractor(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -60,6 +64,11 @@ def _is_transient_model_error(error):
     return bool(status_codes & TRANSIENT_MODEL_STATUSES) or any(
         marker in message for marker in TRANSIENT_MODEL_ERRORS
     )
+
+
+def _is_daily_quota_error(error):
+    message = str(error).lower()
+    return 'per day' in message and ('quota' in message or 'limit exceeded' in message)
 
 
 def _decode_part(part):
@@ -199,6 +208,10 @@ def extract_job_data(email_text: str):
                 extracted_data['status'] = valid_statuses[status]
                 return extracted_data
             except Exception as error:
+                if _is_daily_quota_error(error):
+                    raise GeminiDailyQuotaExceeded(
+                        "Gemini daily request quota is exhausted; stopping AI processing for this run."
+                    ) from error
                 if not _is_transient_model_error(error):
                     raise
                 last_error = error
@@ -250,9 +263,11 @@ def process_recent_emails(service):
     attempted_count = 0
     recorded_count = 0
     failed_count = 0
+    deferred_count = 0
+    quota_exhausted = False
     max_per_run = 30
 
-    for msg in messages:
+    for message_index, msg in enumerate(messages):
         if attempted_count >= max_per_run:
             print("🛑 Reached maximum 30 emails for this run. Stopping to protect GitHub minutes.")
             break
@@ -308,16 +323,43 @@ def process_recent_emails(service):
                 received_date = email_date.date() if email_date else 'No Date'
                 print(f"✅ Success: Upserted {company_name} - {status} ({received_date})")
             time.sleep(15)
+        except GeminiDailyQuotaExceeded as error:
+            deferred_count += 1
+            quota_exhausted = True
+            print(f"⏸️ Deferring remaining emails because Gemini daily quota is exhausted: {error}")
+            break
+        except psycopg.Error:
+            raise
         except Exception as error:
             failed_count += 1
             print(f"⚠️ Failed to process email {msg_id}; it can be retried next run: {error}")
 
-    print(
+    if quota_exhausted:
+        deferred_count += sum(
+            1 for message in messages[message_index + 1:]
+            if message['id'] not in processed_ids
+        )
+
+    summary = (
         f"Worker summary: {attempted_count} attempted, "
-        f"{recorded_count} recorded as processed or skipped, {failed_count} failed."
+        f"{recorded_count} recorded as processed or skipped, "
+        f"{failed_count} failed and eligible for retry, {deferred_count} deferred."
     )
-    if failed_count:
-        raise RuntimeError(f"{failed_count} email(s) failed; see errors above.")
+    print(summary)
+
+    if failed_count or deferred_count:
+        print("::warning::The worker completed with emails eligible for a later retry.")
+
+    summary_path = os.getenv('GITHUB_STEP_SUMMARY')
+    if summary_path:
+        with open(summary_path, 'a', encoding='utf-8') as summary_file:
+            summary_file.write(
+                "## Worker run summary\n\n"
+                f"- Attempted: {attempted_count}\n"
+                f"- Recorded as processed or skipped: {recorded_count}\n"
+                f"- Failed and eligible for retry: {failed_count}\n"
+                f"- Deferred: {deferred_count}\n"
+            )
 
 if __name__ == "__main__":
     print("Starting automated Reverse ATS pipeline...")

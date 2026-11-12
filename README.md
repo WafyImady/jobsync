@@ -39,7 +39,7 @@ Standard ATS platforms are enterprise tools used by companies to ingest resumes,
 4. **Store:** The extracted data is upserted into a Neon PostgreSQL database.
 5. **Visualize:** The Next.js frontend queries the database and renders the updated state on the JobSync dashboard.
 
-The worker retries transient Gemini errors using the fallback model, reads plain-text or HTML email bodies (including nested MIME parts), and records handled Gmail message IDs in a `worker_processed_emails` table. It creates this table automatically; the database role used by `DATABASE_URL` must be allowed to create tables.
+The worker retries transient Gemini errors using the fallback model, reads plain-text or HTML email bodies (including nested MIME parts), and records handled Gmail message IDs in a `worker_processed_emails` table. It creates this table automatically; the database role used by `DATABASE_URL` must be allowed to create tables. When Gemini's daily quota is exhausted, it stops AI requests and leaves remaining emails for a later run. Email-level failures are reported as GitHub Actions warnings and remain eligible for retry; database failures still fail the run.
 
 ## 📦 Setup & Installation
 
